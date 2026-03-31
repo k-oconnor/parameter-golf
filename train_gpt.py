@@ -6,6 +6,7 @@ Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `t
 
 from __future__ import annotations
 
+import atexit
 import copy
 import glob
 import io
@@ -26,6 +27,8 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+from rbl_atn import RBLCausalSelfAttention
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -70,6 +73,16 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
+    # Attention: "flash" = baseline GQA + SDPA; "rbl" = rule-bounded typed heads (full MHA, no GQA).
+    # RBL default: one head per logic op (4 heads: always, eventually, until, next) unless RBL_HEAD_CONFIG is set.
+    attention_backend = os.environ.get("ATTENTION_BACKEND", "flash").strip().lower()
+
+    # torch.compile (Inductor) needs a working Triton on Linux CUDA builds; set TORCH_COMPILE=0 for eager (e.g. Windows smoke tests).
+    torch_compile = bool(int(os.environ.get("TORCH_COMPILE", "1")))
+
+    # Default SDPA stack prefers Flash; Windows wheels often lack it — set SDP_ALLOW_MATH=1 to enable the math fallback for local runs.
+    sdp_allow_math = bool(int(os.environ.get("SDP_ALLOW_MATH", "0")))
+
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
@@ -85,6 +98,87 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+
+
+# One attention head per Łukasiewicz-LTLf-style op; default RBL layout uses exactly these four.
+RBL_OPS_HEAD_TYPES: tuple[str, ...] = ("always", "eventually", "until", "next")
+RBL_DEFAULT_NUM_HEADS = len(RBL_OPS_HEAD_TYPES)
+
+
+def parse_rbl_head_config(num_heads: int, raw: str) -> list[str]:
+    """Parse non-empty RBL_HEAD_CONFIG: comma-separated types; count must match num_heads."""
+    pattern = (raw or "").strip()
+    unit = list(RBL_OPS_HEAD_TYPES)
+    if not pattern:
+        raise ValueError(
+            "RBL_HEAD_CONFIG is empty. Omit it to use the default four heads "
+            f"({', '.join(RBL_OPS_HEAD_TYPES)}), or set an explicit comma-separated list matching NUM_HEADS."
+        )
+    parts = [p.strip().lower() for p in pattern.split(",") if p.strip()]
+    if len(parts) != num_heads:
+        raise ValueError(
+            f"RBL_HEAD_CONFIG must contain exactly NUM_HEADS ({num_heads}) comma-separated types; "
+            f"got {len(parts)}: {parts!r}"
+        )
+    valid = frozenset(unit)
+    bad = [p for p in parts if p not in valid]
+    if bad:
+        raise ValueError(f"Unknown RBL head type(s) {bad}; allowed: {sorted(valid)}")
+    return parts
+
+
+def _pid_exists(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        import ctypes
+
+        k = ctypes.windll.kernel32
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        h = k.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, ctypes.c_uint(pid))
+        if not h:
+            return False
+        k.CloseHandle(h)
+        return True
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def acquire_single_train_lock() -> None:
+    """Avoid multiple accidental train_gpt launches (same cwd) — a common cause of GPU/RAM thrashing and OS freezes."""
+    if os.environ.get("TRAIN_GPT_ALLOW_MULT"):
+        return
+    lock_path = Path("logs") / ".train_gpt.lock"
+    my_pid = str(os.getpid())
+    if lock_path.is_file():
+        try:
+            other = int(lock_path.read_text(encoding="utf-8").strip())
+        except (ValueError, OSError):
+            other = -1
+        if _pid_exists(other):
+            raise RuntimeError(
+                f"Another train_gpt.py is already running (PID {other}). "
+                f"Stop it in Task Manager, or remove stale {lock_path} after a crash, "
+                "or set TRAIN_GPT_ALLOW_MULT=1 for intentional multi-run."
+            )
+        try:
+            lock_path.unlink()
+        except OSError:
+            pass
+    lock_path.write_text(my_pid, encoding="utf-8")
+
+    def _release_lock() -> None:
+        try:
+            if lock_path.is_file() and lock_path.read_text(encoding="utf-8").strip() == my_pid:
+                lock_path.unlink()
+        except OSError:
+            pass
+
+    atexit.register(_release_lock)
+
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -626,11 +720,29 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        attention_backend: str = "flash",
+        seq_len: int = 1024,
+        rbl_head_config: list[str] | None = None,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        if attention_backend == "rbl":
+            if rbl_head_config is None:
+                raise ValueError("rbl_head_config is required when attention_backend='rbl'")
+            self.attn = RBLCausalSelfAttention(
+                dim,
+                num_heads,
+                num_kv_heads,
+                rope_base,
+                qk_gain_init,
+                seq_len,
+                rbl_head_config,
+            )
+        elif attention_backend == "flash":
+            self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        else:
+            raise ValueError(f"Unknown ATTENTION_BACKEND={attention_backend!r}; use 'flash' or 'rbl'")
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -659,6 +771,9 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        attention_backend: str = "flash",
+        train_seq_len: int = 1024,
+        rbl_head_config: list[str] | None = None,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -680,6 +795,9 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    attention_backend=attention_backend,
+                    seq_len=train_seq_len,
+                    rbl_head_config=rbl_head_config,
                 )
                 for i in range(num_layers)
             ]
@@ -733,7 +851,8 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    if args.torch_compile:
+        zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -766,11 +885,12 @@ def main() -> None:
     enable_cudnn_sdp(False)
     enable_flash_sdp(True)
     enable_mem_efficient_sdp(False)
-    enable_math_sdp(False)
+    enable_math_sdp(args.sdp_allow_math)
 
     logfile = None
     if master_process:
         os.makedirs("logs", exist_ok=True)
+        acquire_single_train_lock()
         logfile = f"logs/{args.run_id}.txt"
         print(logfile)
 
@@ -823,24 +943,53 @@ def main() -> None:
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
 
+    model_heads = args.num_heads
+    model_kv = args.num_kv_heads
+    rbl_head_cfg: list[str] | None = None
+    if args.attention_backend == "rbl":
+        cfg_raw = os.environ.get("RBL_HEAD_CONFIG", "").strip()
+        if not cfg_raw:
+            rbl_head_cfg = list(RBL_OPS_HEAD_TYPES)
+            model_heads = RBL_DEFAULT_NUM_HEADS
+            model_kv = RBL_DEFAULT_NUM_HEADS
+            if args.num_heads != model_heads or args.num_kv_heads != model_kv:
+                log0(
+                    f"attention:rbl default {RBL_DEFAULT_NUM_HEADS} heads (one per op); "
+                    f"using num_heads={model_heads} num_kv_heads={model_kv} "
+                    f"(NUM_HEADS/NUM_KV_HEADS env were {args.num_heads}/{args.num_kv_heads})"
+                )
+        else:
+            if args.num_kv_heads != args.num_heads:
+                raise ValueError(
+                    "ATTENTION_BACKEND=rbl requires NUM_KV_HEADS=NUM_HEADS when RBL_HEAD_CONFIG is set. "
+                    f"Got NUM_HEADS={args.num_heads} NUM_KV_HEADS={args.num_kv_heads}."
+                )
+            rbl_head_cfg = parse_rbl_head_config(args.num_heads, cfg_raw)
+
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
         model_dim=args.model_dim,
-        num_heads=args.num_heads,
-        num_kv_heads=args.num_kv_heads,
+        num_heads=model_heads,
+        num_kv_heads=model_kv,
         mlp_mult=args.mlp_mult,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        attention_backend=args.attention_backend,
+        train_seq_len=args.train_seq_len,
+        rbl_head_config=rbl_head_cfg,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    if args.torch_compile:
+        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    else:
+        compiled_model = base_model
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
@@ -894,9 +1043,19 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
+    log0(f"torch_compile:{args.torch_compile}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
-    log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
-    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(
+        f"sdp_backends:cudnn=False flash=True mem_efficient=False math={args.sdp_allow_math}"
+    )
+    log0(
+        f"attention_backend:{args.attention_backend} num_heads:{model_heads} "
+        f"num_kv_heads:{model_kv}"
+    )
+    if args.attention_backend == "rbl" and rbl_head_cfg is not None:
+        log0(f"rbl_head_config:{','.join(rbl_head_cfg)}")
+    elif args.attention_backend == "flash":
+        log0("attention_mode:gqa sdpa_flash")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "

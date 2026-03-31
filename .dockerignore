@@ -1,0 +1,13 @@
+.git
+.gitignore
+__pycache__
+*.pyc
+.pytest_cache
+.cursor
+records
+logs
+*.pt
+*.ptz
+*.log
+data/datasets/**/*.bin
+agent-transcripts
