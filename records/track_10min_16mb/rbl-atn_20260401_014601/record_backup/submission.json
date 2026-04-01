@@ -1,0 +1,9 @@
+{
+  "author": "Your Name",
+  "github_handle": "k-oconnor",
+  "run_id": "rbl_7L_480_20260401_0105",
+  "val_bpb": 0.14250345,
+  "final_int8_zlib_bytes": 15166598,
+  "model_params": 13408870,
+  "description": "RBL attention 7Lx480 with extreme int8 zlib, stable 8xH100 600s run."
+}
